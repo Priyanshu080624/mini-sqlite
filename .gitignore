@@ -1,0 +1,13 @@
+# CMake build folder
+build/
+
+# Database files created by the application
+test.db
+*.db
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Visual Studio Code settings
+.vscode/
