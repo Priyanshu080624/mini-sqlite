@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.15)
 project(mini_sqlite CXX)
 
+if(WIN32)
+    add_compile_options(/utf-8)
+endif()
+
 # Require C++20
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
