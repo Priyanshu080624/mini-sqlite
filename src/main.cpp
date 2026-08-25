@@ -1,6 +1,5 @@
 #include "storage/pager.h"
 #include "storage/btree.h"
-#include "storage/cursor.h"
 #include "common/row.h"
 #include <iostream>
 #include <cassert>
@@ -10,94 +9,71 @@ Row make_user(int64_t id, const std::string& name, int64_t age) {
 }
 
 int main() {
-    const char* db_file = "cursor_test.db";
-    remove(db_file);
+    remove("m2_test.db");
 
-    // ── Setup: create table and insert rows ──
+    // ── Test 1: insert 50 rows (forces 2 leaf splits) ──
+    std::cout << "=== Test 1: Insert 50 rows (forces splits) ===\n";
     PageId root_id;
     {
-        Pager pager(db_file);
+        Pager pager("m2_test.db");
         root_id = BTree::create(pager);
         BTree tree(pager, root_id, 3);
-        tree.insert(make_user(1, "Alice", 30));
-        tree.insert(make_user(2, "Bob",   25));
-        tree.insert(make_user(3, "Carol", 28));
-        tree.insert(make_user(4, "Dan",   22));
-        tree.insert(make_user(5, "Eve",   35));
+
+        for (int64_t i = 1; i <= 50; i++)
+            tree.insert(make_user(i, "user" + std::to_string(i), i + 20));
+
+        // IMPORTANT: root_id changes when splits create a new root page
+        // Always save tree.root_page_id(), not the original create() id
+        root_id = tree.root_page_id();
+
+        std::cout << "Inserted 50 rows. Final root page = " << root_id << "\n";
+        auto rows = tree.scan_all();
+        assert(rows.size() == 50);
+        for (size_t i = 0; i < rows.size(); i++)
+            assert(std::get<int64_t>(rows[i][0]) == (int64_t)(i+1));
+        std::cout << "In-memory scan: " << rows.size() << " rows, sorted correctly\n";
     }
 
-    // ── Test 1: SeqScan pattern ──
-    std::cout << "=== Test 1: Full table scan (SeqScan pattern) ===\n";
+    // ── Test 2: reopen and verify all 50 rows survive ──
+    std::cout << "\n=== Test 2: Reopen and verify persistence ===\n";
     {
-        Pager pager(db_file);
-        BTreeCursor cursor(pager, root_id, 3);
-        cursor.rewind();
-        int count = 0;
-        while (!cursor.is_exhausted()) {
-            Row r = cursor.current();
-            std::cout << "  " << r << "\n";
-            count++;
-            cursor.next();
-        }
-        assert(count == 5);
-        std::cout << "  Scanned " << count << " rows\n";
+        Pager pager("m2_test.db");
+        BTree tree(pager, root_id, 3);
+
+        auto rows = tree.scan_all();
+        std::cout << "After restart: " << rows.size() << " rows\n";
+        assert(rows.size() == 50);
+
+        auto r1  = tree.search(1);
+        auto r25 = tree.search(25);
+        auto r50 = tree.search(50);
+        assert(r1.has_value()  && std::get<int64_t>((*r1)[0])  == 1);
+        assert(r25.has_value() && std::get<int64_t>((*r25)[0]) == 25);
+        assert(r50.has_value() && std::get<int64_t>((*r50)[0]) == 50);
+        std::cout << "search(1)  = " << *r1  << "\n";
+        std::cout << "search(25) = " << *r25 << "\n";
+        std::cout << "search(50) = " << *r50 << "\n";
     }
 
-    // ── Test 2: Point lookup ──
-    std::cout << "\n=== Test 2: Point lookups (seek) ===\n";
+    // ── Test 3: reverse-order inserts across split boundary ──
+    std::cout << "\n=== Test 3: Reverse-order inserts ===\n";
     {
-        Pager pager(db_file);
-        BTreeCursor cursor(pager, root_id, 3);
+        remove("m2_test2.db");
+        Pager pager("m2_test2.db");
+        PageId rid = BTree::create(pager);
+        BTree tree(pager, rid, 3);
 
-        bool found = cursor.seek(Key(int64_t(3)));
-        assert(found);
-        Row r = cursor.current();
-        assert(std::get<std::string>(r[1]) == "Carol");
-        std::cout << "  seek(3) = " << r << "\n";
+        for (int64_t i = 50; i >= 1; i--)
+            tree.insert(make_user(i, "user" + std::to_string(i), i));
 
-        found = cursor.seek(Key(int64_t(1)));
-        assert(found);
-        r = cursor.current();
-        assert(std::get<std::string>(r[1]) == "Alice");
-        std::cout << "  seek(1) = " << r << "\n";
-
-        found = cursor.seek(Key(int64_t(99)));
-        assert(!found);
-        std::cout << "  seek(99) = not found\n";
+        rid = tree.root_page_id();
+        auto rows = tree.scan_all();
+        assert(rows.size() == 50);
+        for (size_t i = 0; i < rows.size(); i++)
+            assert(std::get<int64_t>(rows[i][0]) == (int64_t)(i+1));
+        std::cout << "50 reverse-order inserts: all sorted correctly\n";
     }
 
-    // ── Test 3: seek then scan forward ──
-    std::cout << "\n=== Test 3: Seek then scan forward ===\n";
-    {
-        Pager pager(db_file);
-        BTreeCursor cursor(pager, root_id, 3);
-        cursor.seek(Key(int64_t(2)));
-        std::cout << "  Starting from key=2:\n";
-        while (!cursor.is_exhausted()) {
-            Row r = cursor.current();
-            std::cout << "    " << r << "\n";
-            cursor.next();
-        }
-    }
-
-    // ── Test 4: insert via cursor ──
-    std::cout << "\n=== Test 4: Insert via cursor ===\n";
-    {
-        Pager pager(db_file);
-        BTreeCursor cursor(pager, root_id, 3);
-        cursor.insert(make_user(6, "Frank", 29));
-        cursor.rewind();
-        int count = 0;
-        while (!cursor.is_exhausted()) {
-            Row r = cursor.current();
-            std::cout << "  " << r << "\n";
-            count++;
-            cursor.next();
-        }
-        assert(count == 6);
-        std::cout << "  Total rows after insert: " << count << "\n";
-    }
-
-    std::cout << "\nAll cursor tests passed.\n";
+    std::cout << "\nAll M2 split tests passed.\n";
     return 0;
 }
