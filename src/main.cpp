@@ -1,79 +1,92 @@
 #include "storage/pager.h"
 #include "storage/btree.h"
+#include "storage/index_manager.h"
+#include "exec/seq_scan.h"
+#include "exec/filter.h"
+#include "exec/index_scan.h"
 #include "common/row.h"
 #include <iostream>
 #include <cassert>
+#include <chrono>
 
-Row make_user(int64_t id, const std::string& name, int64_t age) {
-    return { Value(id), Value(name), Value(age) };
-}
+using Clock = std::chrono::high_resolution_clock;
+using Ms    = std::chrono::duration<double, std::milli>;
 
 int main() {
-    remove("m2_test.db");
+    const int N = 500;
+    remove("m3_test.db");
 
-    // ── Test 1: insert 50 rows (forces 2 leaf splits) ──
-    std::cout << "=== Test 1: Insert 50 rows (forces splits) ===\n";
-    PageId root_id;
+    std::cout << "=== M3: Building table with " << N << " rows ===\n";
+
+    PageId table_root, idx_root;
+    int64_t target_pk = N / 2;
+    std::string target_name = "user" + std::to_string(target_pk);
+
     {
-        Pager pager("m2_test.db");
-        root_id = BTree::create(pager);
-        BTree tree(pager, root_id, 3);
+        Pager pager("m3_test.db");
+        table_root = BTree::create(pager);
+        idx_root   = IndexManager::create(pager);
 
-        for (int64_t i = 1; i <= 50; i++)
-            tree.insert(make_user(i, "user" + std::to_string(i), i + 20));
+        BTree table(pager, table_root, 3);
+        auto t0 = Clock::now();
 
-        // IMPORTANT: root_id changes when splits create a new root page
-        // Always save tree.root_page_id(), not the original create() id
-        root_id = tree.root_page_id();
+        for (int64_t i = 1; i <= N; i++) {
+            std::string name = "user" + std::to_string(i);
+            Row row = { Value(i), Value(name), Value(i % 100) };
+            table.insert(row);
+            // IMPORTANT: save updated root after each insert (splits change it)
+            idx_root = IndexManager::insert_entry(pager, idx_root,
+                                                  Value(name), i);
+        }
+        table_root = table.root_page_id();
 
-        std::cout << "Inserted 50 rows. Final root page = " << root_id << "\n";
-        auto rows = tree.scan_all();
-        assert(rows.size() == 50);
-        for (size_t i = 0; i < rows.size(); i++)
-            assert(std::get<int64_t>(rows[i][0]) == (int64_t)(i+1));
-        std::cout << "In-memory scan: " << rows.size() << " rows, sorted correctly\n";
+        double ms = Ms(Clock::now() - t0).count();
+        std::cout << "Inserted " << N << " rows + index in " << ms << "ms\n";
+        std::cout << "Table root: " << table_root
+                  << "  Index root: " << idx_root << "\n";
     }
 
-    // ── Test 2: reopen and verify all 50 rows survive ──
-    std::cout << "\n=== Test 2: Reopen and verify persistence ===\n";
+    // ── Without index: SeqScan + Filter ──
+    std::cout << "\n=== Without index: SeqScan + Filter ===\n";
+    double seq_ms;
     {
-        Pager pager("m2_test.db");
-        BTree tree(pager, root_id, 3);
-
-        auto rows = tree.scan_all();
-        std::cout << "After restart: " << rows.size() << " rows\n";
-        assert(rows.size() == 50);
-
-        auto r1  = tree.search(1);
-        auto r25 = tree.search(25);
-        auto r50 = tree.search(50);
-        assert(r1.has_value()  && std::get<int64_t>((*r1)[0])  == 1);
-        assert(r25.has_value() && std::get<int64_t>((*r25)[0]) == 25);
-        assert(r50.has_value() && std::get<int64_t>((*r50)[0]) == 50);
-        std::cout << "search(1)  = " << *r1  << "\n";
-        std::cout << "search(25) = " << *r25 << "\n";
-        std::cout << "search(50) = " << *r50 << "\n";
+        Pager pager("m3_test.db");
+        auto t0 = Clock::now();
+        auto scan = std::make_unique<SeqScan>(pager, table_root, 3);
+        Filter filter(std::move(scan), [&](const Row& r) {
+            return std::get<std::string>(r[1]) == target_name;
+        });
+        filter.open();
+        std::optional<Row> found;
+        while (auto row = filter.next()) found = row;
+        filter.close();
+        seq_ms = Ms(Clock::now() - t0).count();
+        assert(found.has_value());
+        std::cout << "Found: " << *found << "\n";
+        std::cout << "Time:  " << seq_ms << "ms\n";
     }
 
-    // ── Test 3: reverse-order inserts across split boundary ──
-    std::cout << "\n=== Test 3: Reverse-order inserts ===\n";
+    // ── With index: IndexScan ──
+    std::cout << "\n=== With index: IndexScan ===\n";
+    double idx_ms;
     {
-        remove("m2_test2.db");
-        Pager pager("m2_test2.db");
-        PageId rid = BTree::create(pager);
-        BTree tree(pager, rid, 3);
-
-        for (int64_t i = 50; i >= 1; i--)
-            tree.insert(make_user(i, "user" + std::to_string(i), i));
-
-        rid = tree.root_page_id();
-        auto rows = tree.scan_all();
-        assert(rows.size() == 50);
-        for (size_t i = 0; i < rows.size(); i++)
-            assert(std::get<int64_t>(rows[i][0]) == (int64_t)(i+1));
-        std::cout << "50 reverse-order inserts: all sorted correctly\n";
+        Pager pager("m3_test.db");
+        auto t0 = Clock::now();
+        IndexScan iscan(pager, table_root, idx_root, 3, Value(target_name));
+        iscan.open();
+        auto found = iscan.next();
+        iscan.close();
+        idx_ms = Ms(Clock::now() - t0).count();
+        assert(found.has_value());
+        std::cout << "Found: " << *found << "\n";
+        std::cout << "Time:  " << idx_ms << "ms\n";
     }
 
-    std::cout << "\nAll M2 split tests passed.\n";
+    std::cout << "\n=== Benchmark summary ===\n";
+    std::cout << "SeqScan+Filter : " << seq_ms << "ms\n";
+    std::cout << "IndexScan      : " << idx_ms << "ms\n";
+    if (idx_ms > 0)
+        std::cout << "Speedup        : " << (seq_ms/idx_ms) << "x\n";
+    std::cout << "\nM3 complete.\n";
     return 0;
 }
