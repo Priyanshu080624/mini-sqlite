@@ -1,92 +1,132 @@
 #include "storage/pager.h"
 #include "storage/btree.h"
-#include "storage/index_manager.h"
-#include "exec/seq_scan.h"
-#include "exec/filter.h"
-#include "exec/index_scan.h"
+#include "storage/wal.h"
+#include "storage/txn_manager.h"
+#include "storage/recovery.h"
+#include "storage/btree_node.h"
 #include "common/row.h"
 #include <iostream>
 #include <cassert>
-#include <chrono>
+#include <fstream>
 
-using Clock = std::chrono::high_resolution_clock;
-using Ms    = std::chrono::duration<double, std::milli>;
+const char* DB       = "m4_test.db";
+const char* WAL_FILE = "m4_test.wal";
+
+// Helper: snapshot all current pages before a write, then log diffs after
+// This is the correct WAL integration pattern:
+//   1. snapshot before-state
+//   2. do the write
+//   3. log before+after for every page that changed
+void wal_protected_insert(Pager& pager, WAL& wal, uint64_t txn_id,
+                          BTree& tree, Row row) {
+    uint32_t page_count_before = pager.page_count();
+
+    // Snapshot all existing pages before insert
+    std::unordered_map<PageId, std::array<std::byte, PAGE_SIZE>> before_images;
+    for (uint32_t pid = 0; pid < page_count_before; pid++) {
+        before_images[pid] = pager.get_page(pid)->data;
+    }
+
+    // Do the insert
+    tree.insert(row);
+
+    // Log every page that changed (or was newly allocated)
+    for (uint32_t pid = 0; pid < pager.page_count(); pid++) {
+        Page* p = pager.get_page(pid);
+        if (pid < page_count_before) {
+            // Existing page — check if it changed
+            if (p->data != before_images[pid]) {
+                wal.write_page(txn_id, pid, before_images[pid], p->data);
+            }
+        } else {
+            // Newly allocated page — before-image is all zeros
+            std::array<std::byte, PAGE_SIZE> zeroes{};
+            wal.write_page(txn_id, pid, zeroes, p->data);
+        }
+    }
+}
+
+void session1_commit() {
+    std::cout << "=== Session 1: committed transaction ===\n";
+    remove(DB); remove(WAL_FILE); remove("root.txt");
+
+    Pager pager(DB);
+    WAL wal(WAL_FILE);
+
+    PageId root = BTree::create(pager);
+    BTree tree(pager, root, 3);
+
+    uint64_t tid = 1;
+    wal.write_begin(tid);
+
+    // Snapshot before, insert, log changes
+    wal_protected_insert(pager, wal, tid, tree,
+        {Value(int64_t(1)), Value(std::string("Alice")), Value(int64_t(30))});
+
+    root = tree.root_page_id();
+    wal.write_commit(tid);
+    pager.flush_all();
+
+    std::ofstream f("root.txt");
+    f << root;
+    std::cout << "  Alice (pk=1) committed. Root=" << root << "\n";
+}
+
+void session2_crash() {
+    std::cout << "\n=== Session 2: crash mid-transaction ===\n";
+    PageId root; { std::ifstream f("root.txt"); f >> root; }
+
+    Pager pager(DB);
+    WAL wal(WAL_FILE);
+
+    BTree tree(pager, root, 3);
+
+    uint64_t tid = 2;
+    wal.write_begin(tid);
+
+    // Snapshot before, insert Bob, log page changes — but NO commit
+    wal_protected_insert(pager, wal, tid, tree,
+        {Value(int64_t(2)), Value(std::string("Bob")), Value(int64_t(25))});
+
+    // Pager destructor flushes Bob's dirty page to disk — worst-case crash
+    std::cout << "  WAL has Bob's PAGE_WRITE but no COMMIT.\n";
+    std::cout << "  CRASH (pager destructor flushes Bob to disk)...\n";
+}
+
+void session3_recovery() {
+    std::cout << "\n=== Session 3: recovery on restart ===\n";
+    Pager pager(DB);
+    WAL wal(WAL_FILE);
+    auto [redone, undone] = Recovery::run(pager, wal, true);
+    std::cout << "  Redone=" << redone << " Undone=" << undone << "\n";
+}
+
+void session4_verify() {
+    std::cout << "\n=== Session 4: verify state ===\n";
+    PageId root; { std::ifstream f("root.txt"); f >> root; }
+
+    Pager pager(DB);
+    BTree tree(pager, root, 3);
+
+    auto rows = tree.scan_all();
+    std::cout << "  Rows: " << rows.size() << "\n";
+    for (const auto& r : rows) std::cout << "  " << r << "\n";
+
+    auto alice = tree.search(1);
+    auto bob   = tree.search(2);
+
+    assert(alice.has_value() && "Alice should be present");
+    assert(!bob.has_value()  && "Bob should be gone");
+
+    std::cout << "\n  Alice (committed): " << *alice << " [present]\n";
+    std::cout << "  Bob (crashed):     NOT FOUND [correctly absent]\n";
+    std::cout << "\nM4 PASSED.\n";
+}
 
 int main() {
-    const int N = 500;
-    remove("m3_test.db");
-
-    std::cout << "=== M3: Building table with " << N << " rows ===\n";
-
-    PageId table_root, idx_root;
-    int64_t target_pk = N / 2;
-    std::string target_name = "user" + std::to_string(target_pk);
-
-    {
-        Pager pager("m3_test.db");
-        table_root = BTree::create(pager);
-        idx_root   = IndexManager::create(pager);
-
-        BTree table(pager, table_root, 3);
-        auto t0 = Clock::now();
-
-        for (int64_t i = 1; i <= N; i++) {
-            std::string name = "user" + std::to_string(i);
-            Row row = { Value(i), Value(name), Value(i % 100) };
-            table.insert(row);
-            // IMPORTANT: save updated root after each insert (splits change it)
-            idx_root = IndexManager::insert_entry(pager, idx_root,
-                                                  Value(name), i);
-        }
-        table_root = table.root_page_id();
-
-        double ms = Ms(Clock::now() - t0).count();
-        std::cout << "Inserted " << N << " rows + index in " << ms << "ms\n";
-        std::cout << "Table root: " << table_root
-                  << "  Index root: " << idx_root << "\n";
-    }
-
-    // ── Without index: SeqScan + Filter ──
-    std::cout << "\n=== Without index: SeqScan + Filter ===\n";
-    double seq_ms;
-    {
-        Pager pager("m3_test.db");
-        auto t0 = Clock::now();
-        auto scan = std::make_unique<SeqScan>(pager, table_root, 3);
-        Filter filter(std::move(scan), [&](const Row& r) {
-            return std::get<std::string>(r[1]) == target_name;
-        });
-        filter.open();
-        std::optional<Row> found;
-        while (auto row = filter.next()) found = row;
-        filter.close();
-        seq_ms = Ms(Clock::now() - t0).count();
-        assert(found.has_value());
-        std::cout << "Found: " << *found << "\n";
-        std::cout << "Time:  " << seq_ms << "ms\n";
-    }
-
-    // ── With index: IndexScan ──
-    std::cout << "\n=== With index: IndexScan ===\n";
-    double idx_ms;
-    {
-        Pager pager("m3_test.db");
-        auto t0 = Clock::now();
-        IndexScan iscan(pager, table_root, idx_root, 3, Value(target_name));
-        iscan.open();
-        auto found = iscan.next();
-        iscan.close();
-        idx_ms = Ms(Clock::now() - t0).count();
-        assert(found.has_value());
-        std::cout << "Found: " << *found << "\n";
-        std::cout << "Time:  " << idx_ms << "ms\n";
-    }
-
-    std::cout << "\n=== Benchmark summary ===\n";
-    std::cout << "SeqScan+Filter : " << seq_ms << "ms\n";
-    std::cout << "IndexScan      : " << idx_ms << "ms\n";
-    if (idx_ms > 0)
-        std::cout << "Speedup        : " << (seq_ms/idx_ms) << "x\n";
-    std::cout << "\nM3 complete.\n";
+    session1_commit();
+    session2_crash();
+    session3_recovery();
+    session4_verify();
     return 0;
 }
